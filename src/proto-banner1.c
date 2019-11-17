@@ -22,6 +22,7 @@
 #include "scripting.h"
 #include "versioning.h"
 #include "util-malloc.h"
+#include "proto-socks5.h"
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,9 +33,9 @@
 struct Patterns patterns[] = {
     {"\x00\x00" "**" "\xff" "SMB", 8, PROTO_SMB, SMACK_ANCHOR_BEGIN | SMACK_WILDCARDS, 0},
     {"\x00\x00" "**" "\xfe" "SMB", 8, PROTO_SMB, SMACK_ANCHOR_BEGIN | SMACK_WILDCARDS, 0},
-    
+
     {"\x82\x00\x00\x00", 4, PROTO_SMB, SMACK_ANCHOR_BEGIN, 0}, /* Positive Session Response */
-    
+
     {"\x83\x00\x00\x01\x80", 5, PROTO_SMB, SMACK_ANCHOR_BEGIN, 0}, /* Not listening on called name */
     {"\x83\x00\x00\x01\x81", 5, PROTO_SMB, SMACK_ANCHOR_BEGIN, 0}, /* Not listening for calling name */
     {"\x83\x00\x00\x01\x82", 5, PROTO_SMB, SMACK_ANCHOR_BEGIN, 0}, /* Called name not present */
@@ -70,8 +71,8 @@ struct Patterns patterns[] = {
     {"RFB 004.001\n", 12, PROTO_VNC_RFB, SMACK_ANCHOR_BEGIN, 8}, /* RealVNC 4.6 */
     {"RFB 004.002\n", 12, PROTO_VNC_RFB, SMACK_ANCHOR_BEGIN, 8},
     {"STAT pid ",      9, PROTO_MEMCACHED,SMACK_ANCHOR_BEGIN, 0}, /* memcached stat response */
-    
-    
+
+
     {"\xff\xfb\x01\xff\xf0", 5, PROTO_TELNET, 0, 0},
     {"\xff\xfb\x01\xff\xfb", 5, PROTO_TELNET, 0, 0},
     {"\xff\xfb\x01\xff\xfc", 5, PROTO_TELNET, 0, 0},
@@ -93,11 +94,13 @@ struct Patterns patterns[] = {
     {"\xff\xfb\x01login",    8, PROTO_TELNET, SMACK_ANCHOR_BEGIN, 0},
     {"login:",               6, PROTO_TELNET, SMACK_ANCHOR_BEGIN, 0},
     {"password:",            9, PROTO_TELNET, SMACK_ANCHOR_BEGIN, 0},
-    
+
     {"\x03\x00\x00\x13\x0e\xd0\xbe\xef\x12\x34\x00\x02\x0f\x08\x00\x00\x00\x00\x00",
         12, PROTO_RDP, SMACK_ANCHOR_BEGIN, 0},
     {"\x03\x00\x00\x13\x0e\xd0\x00\x00\x12\x34\x00\x02\x0f\x08\x00\x00\x00\x00\x00",
         12, PROTO_RDP, SMACK_ANCHOR_BEGIN, 0},
+
+    {"\x05\x00", 2, PROTO_SOCKS5, SMACK_ANCHOR_BEGIN, 0},
 
     {0,0,0,0,0}
 };
@@ -197,7 +200,7 @@ banner1_parse(
                               banout,
                               more);
             break;
-            
+
         case PROTO_TELNET:
             banner_telnet.parse(   banner1,
                               banner1->http_fields,
@@ -230,7 +233,7 @@ banner1_parse(
                               banout,
                               more);
             break;
-            
+
     case PROTO_SSH1:
     case PROTO_SSH2:
         /* generic text-based parser
@@ -302,6 +305,14 @@ banner1_parse(
                                    banout,
                                    more);
         break;
+    case PROTO_SOCKS5:
+            banner_socks5.parse(   banner1,
+                                banner1->http_fields,
+                                tcb_state,
+                                px, length,
+                                banout,
+                                more);
+            break;
 
     default:
         fprintf(stderr, "banner1: internal error\n");
@@ -323,7 +334,7 @@ banner1_create(void)
     unsigned i;
 
     b = CALLOC(1, sizeof(*b));
-    
+
 
     /*
      * This creates a pattern-matching blob for heuristically determining
@@ -355,6 +366,7 @@ banner1_create(void)
     b->payloads.tcp[993] = (void*)&banner_ssl;   /* IMAP4/s */
     b->payloads.tcp[994] = (void*)&banner_ssl;
     b->payloads.tcp[995] = (void*)&banner_ssl;   /* POP3/s */
+    b->payloads.tcp[1080] = (void*)&banner_socks5;
     b->payloads.tcp[2083] = (void*)&banner_ssl;  /* cPanel - SSL */
     b->payloads.tcp[2087] = (void*)&banner_ssl;  /* WHM - SSL */
     b->payloads.tcp[2096] = (void*)&banner_ssl;  /* cPanel webmail - SSL */
@@ -364,7 +376,7 @@ banner1_create(void)
     b->payloads.tcp[11211] = (void*)&banner_memcached;
     b->payloads.tcp[23] = (void*)&banner_telnet;
     b->payloads.tcp[3389] = (void*)&banner_rdp;
-    
+
     /* 
      * This goes down the list of all the TCP protocol handlers and initializes
      * them.
@@ -382,7 +394,8 @@ banner1_create(void)
     banner_telnet.init(b);
     banner_rdp.init(b);
     banner_vnc.init(b);
-    
+    banner_socks5.init(b);
+
     /* scripting/versioning come after the rest */
     banner_scripting.init(b);
     banner_versioning.init(b);
@@ -550,31 +563,37 @@ banner1_selftest()
             fprintf(stderr, "SSL banner: selftest failed\n");
             return 1;
         }
-        
+
         x = banner_smb1.selftest();
         if (x) {
             fprintf(stderr, "SMB banner: selftest failed\n");
             return 1;
         }
-        
+
         x = banner_http.selftest();
         if (x) {
             fprintf(stderr, "HTTP banner: selftest failed\n");
             return 1;
         }
-        
+
         x = banner_telnet.selftest();
         if (x) {
             fprintf(stderr, "Telnet banner: selftest failed\n");
             return 1;
         }
-        
+
         x = banner_rdp.selftest();
         if (x) {
             fprintf(stderr, "RDP banner: selftest failed\n");
             return 1;
         }
-        
+
+        x = banner_socks5.selftest();
+        if (x) {
+            fprintf(stderr, "SOCKS5 banner: selftest failed\n");
+            return 1;
+        }
+
         return x;
     }
 }
